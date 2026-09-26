@@ -19,6 +19,7 @@ from f1bot.handlers import admin, garage, market, races, user
 from f1bot.seed import seed_all
 from f1bot.services import races as svc
 from f1bot.services.runtime import ThrottleMiddleware, set_bot, spawn_auto_start
+from f1bot.web import start_health_server
 
 log = logging.getLogger("f1bot")
 
@@ -68,6 +69,9 @@ async def main() -> None:
     if open_race is not None and open_race.status == "open":
         log.info("Resuming auto-start timer for weekend R%s", open_race.round_no)
         spawn_auto_start(max(60, settings.auto_start_minutes * 60), start_race, open_race.id)
+
+    # Render & co: expose a health endpoint on $PORT so the service stays up.
+    start_health_server()
 
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 

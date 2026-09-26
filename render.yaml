@@ -1,0 +1,21 @@
+# Render.com deployment blueprint for the F1 Telegram bot.
+# Deploy: Render dashboard -> New -> Web Service -> point to this repo.
+
+services:
+  - type: web
+    name: f1-game-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false  # set your @BotFather token in the Render dashboard
+      - key: ADMIN_IDS
+        value: ""
+      - key: DATABASE_URL
+        value: sqlite:///f1_bot.db
+      - key: PYTHON_VERSION
+        value: 3.12.7
