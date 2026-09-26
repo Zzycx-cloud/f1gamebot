@@ -6,12 +6,14 @@ import asyncio
 import time
 from typing import Any, Awaitable, Callable, MutableMapping
 
-from aiogram import Bot
-from aiogram.types import CallbackQuery, TelegramObject
+from aiogram import Bot, Dispatcher
+from aiogram.types import CallbackQuery, TelegramObject, Update
 
 from ..config import settings
 
 _bot: Bot | None = None
+_dp: Dispatcher | None = None
+_bot_username: str | None = None
 _races_started: set[int] = set()
 
 
@@ -22,6 +24,66 @@ def set_bot(bot: Bot) -> None:
 
 def get_bot() -> Bot | None:
     return _bot
+
+
+def set_dispatcher(dp: Dispatcher) -> None:
+    """Remember the dispatcher so nav:back can re-dispatch a stored screen."""
+    global _dp
+    _dp = dp
+
+
+def set_bot_username(username: str | None) -> None:
+    global _bot_username
+    _bot_username = username
+
+
+def get_bot_username() -> str | None:
+    return _bot_username
+
+
+# --------------------------------------------------------------------------- #
+# Navigation history: the ⬅️ Back button returns to the previous screen
+# --------------------------------------------------------------------------- #
+_nav_history: MutableMapping[int, list[str]] = {}
+
+
+def push_screen(user_id: int, data: str) -> None:
+    """Record a rendered screen so Back can return to the one before it."""
+    stack = _nav_history.setdefault(int(user_id), [])
+    if not stack or stack[-1] != data:
+        stack.append(data)
+    if len(stack) > 40:
+        del stack[:20]
+
+
+def previous_screen(user_id: int, fallback: str = "nav:menu") -> str:
+    """The callback data of the screen shown before the current one."""
+    stack = _nav_history.get(int(user_id)) or []
+    if len(stack) >= 2:
+        current = stack.pop()
+        while stack and stack[-1] == current:
+            stack.pop()
+        if stack:
+            return stack.pop()
+    return fallback
+
+
+async def redispatch_callback(cb: CallbackQuery, data: str) -> bool:
+    """Re-play a stored callback press through the real dispatcher."""
+    if _dp is None or _bot is None:
+        return False
+    try:
+        fake = CallbackQuery(
+            id=cb.id,
+            chat_instance=cb.chat_instance,
+            data=data,
+            from_user=cb.from_user,
+            message=cb.message,
+        )
+        await _dp.feed_update(_bot, Update(update_id=int(time.time() * 1000) % 2**31, callback_query=fake))
+        return True
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------------- #

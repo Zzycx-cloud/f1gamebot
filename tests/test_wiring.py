@@ -19,7 +19,11 @@ SRC = [Path(__file__).parent.parent / "f1bot" / "keyboards.py"] + sorted(
     (Path(__file__).parent.parent / "f1bot" / "handlers").glob("*.py")
 )
 
-CALLBACK_RE = re.compile(r"btn\(\s*(?:f)?[\"']([^\"']+)[\"']\s*,\s*(?:f)?[\"']([^\"']+)[\"']")
+# btn("label", "callback") AND btn(t(lang, "key"), "callback") — collect the
+# callback literal from either form.
+CALLBACK_RE = re.compile(
+    r"btn\(\s*(?:f?[\"'][^\"']*[\"']|t\([^)]*\))\s*,\s*(?:f)?[\"']([^\"']+)[\"']"
+)
 
 # f-string placeholders -> sample values that a real press could carry
 SAMPLES = {
@@ -41,7 +45,7 @@ def _collect() -> set[str]:
     found = set()
     for path in SRC:
         text = path.read_text(encoding="utf-8")
-        for _label, cb in CALLBACK_RE.findall(text):
+        for cb in CALLBACK_RE.findall(text):
             if ":" in cb or cb == "noop":
                 found.add(_normalize(cb))
     return found

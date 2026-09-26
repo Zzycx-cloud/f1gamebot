@@ -30,6 +30,8 @@ from ..models import (
     Team,
     Track,
     User,
+    UserDriver,
+    UserTeam,
     WeatherLog,
 )
 from . import store, vip, wallet
@@ -100,13 +102,17 @@ def round_info(db: Session | None, round_no: int) -> dict:
 
 
 def next_round_number(db: Session) -> int:
-    last = db.scalar(
-        select(func.max(Race.round_no)).select_from(Race).where(Race.status == "finished")
-    )
-    last = int(last or 0)
+    """A random round that has not been raced yet (falls back to any round).
+
+    The admin asked for the track card to drop at random, like a draw.
+    """
+    used = {
+        int(r) for (r,) in db.execute(select(Race.round_no).where(Race.status == "finished"))
+    }
     tracks = all_tracks(db)
-    highest = max((t["r"] for t in tracks), default=24)
-    return (last % highest) + 1
+    remaining = [int(t["r"]) for t in tracks if int(t["r"]) not in used]
+    pool = remaining or [int(t["r"]) for t in tracks]
+    return random.choice(pool)
 
 
 def current_race(db: Session) -> Race | None:
@@ -355,6 +361,73 @@ def cancel_race(db: Session, race: Race, reason: str = "not enough entries") -> 
     race.participants = 0
     db.flush()
     return refunded
+
+
+# --------------------------------------------------------------------------- #
+# AI entrants (the /arace group mode: bots fill the grid and race)
+# --------------------------------------------------------------------------- #
+BOT_ID_BASE = -910_000
+
+
+def fill_with_bots(db: Session, race: Race, target: int | None = None) -> list[User]:
+    """Fill the entry list with AI drivers so a race can run without humans.
+
+    Bot ids are negative, so they never collide with real Telegram accounts.
+    """
+    if target is None:
+        target = random.randint(max(store.min_participants(db), 6), 10)
+    target = min(max(1, target), store.max_participants(db))
+    need = max(0, target - int(race.participants))
+    teams = list(db.scalars(select(Team).order_by(func.random())))
+    drivers = list(db.scalars(select(Driver).order_by(func.random())))
+    bots: list[User] = []
+    for i in range(need):
+        team = teams[i % len(teams)] if teams else None
+        driver = drivers[i % len(drivers)] if drivers else None
+        bot = db.get(User, BOT_ID_BASE - i)
+        if bot is None:
+            bot = User(
+                id=BOT_ID_BASE - i,
+                username=f"ai_pilot_{i + 1}",
+                first_name=f"🤖 {driver.name if driver else f'AI-{i + 1}'}",
+                balance=0,
+                gold=0,
+            )
+            db.add(bot)
+            db.flush()
+        # reset the previous simulation's contracts, then re-own consistently
+        for row in list(db.scalars(select(UserTeam).where(UserTeam.user_id == bot.id))):
+            db.delete(row)
+        for row in list(db.scalars(select(UserDriver).where(UserDriver.user_id == bot.id))):
+            db.delete(row)
+        bot.team_id = team.id if team else None
+        bot.driver1_id = driver.id if driver else None
+        if team is not None:
+            db.add(UserTeam(user_id=bot.id, team_id=team.id, price_paid=0))
+        if driver is not None:
+            db.add(UserDriver(user_id=bot.id, driver_id=driver.id, price_paid=0))
+        db.add(
+            RaceEntry(
+                race_id=race.id,
+                user_id=bot.id,
+                fee_paid=0,
+                quali_times=[],
+                quali_avg=round(race.lap_record * random.uniform(1.005, 1.06), 3),
+            )
+        )
+        race.participants += 1
+        bots.append(bot)
+    db.flush()
+    return bots
+
+
+def mention(user_id: int, name: str) -> str:
+    """A clickable Telegram mention for real users; plain text for the bots."""
+    from ..format import esc
+
+    if user_id > 0:
+        return f"<a href='tg://user?id={user_id}'>{esc(name)}</a>"
+    return esc(name)
 
 
 # --------------------------------------------------------------------------- #
@@ -717,6 +790,12 @@ def simulate_race(
                     )
                     running.sort(key=lambda e: e.total_time)
 
+    # ---- post-race penalties (must land before the classification sort) --- #
+    for e in entries:
+        if rng.random() < 0.04:
+            e.total_time += 5.0
+            result.events.append((max(1, laps // 2), e.user_id, "penalty", "⚠️ +5s track limits"))
+
     # ---- classification --------------------------------------------------- #
     finishers = sorted([e for e in entries if e.retire_lap is None], key=lambda e: e.total_time)
     retired = sorted([e for e in entries if e.retire_lap is not None], key=lambda e: -(e.retire_lap or 0))
@@ -735,10 +814,6 @@ def simulate_race(
                 result.events.append((laps, row.user_id, "fastest_lap", f"{row.best_lap:.3f}s"))
                 break
 
-    for e in entries:
-        if rng.random() < 0.04:
-            e.total_time += 5.0
-            result.events.append((max(1, laps // 2), e.user_id, "penalty", "⚠️ +5s track limits"))
     for e in entries:
         if rng.random() < 0.03:
             result.events.append((max(1, laps // 3), e.user_id, "track_limits", "🏎️ Track limits warning"))

@@ -31,6 +31,10 @@ router = Router(name="market")
 PER_PAGE = 8
 
 
+def _lang(user) -> str:
+    return user.language if user.language in ("ru", "uz", "en") else "en"
+
+
 # --------------------------------------------------------------------------- #
 # Shop home
 # --------------------------------------------------------------------------- #
@@ -48,12 +52,14 @@ async def cb_shop(event: CallbackQuery | Message) -> None:
             f"👨‍✈️ Drivers on the market: <b>{len(drivers)}+</b>\n\n"
             "Choose a category."
         )
-    await show(event, text, shop_menu())
+    await show(event, text, shop_menu(_lang(user)))
 
 
 @router.callback_query(F.data == "sto:menu")
 async def cb_store(cb: CallbackQuery) -> None:
-    await show(cb, "🛍️ <b>Shop extras</b>\n\nTyre packages really slow your degradation down.", store_menu())
+    with session() as db:
+        user = get_user(db, cb.from_user.id, cb.from_user.username or "", cb.from_user.first_name or "")
+    await show(cb, "🛍️ <b>Shop extras</b>\n\nTyre packages really slow your degradation down.", store_menu(_lang(user)))
 
 
 # --------------------------------------------------------------------------- #
@@ -120,6 +126,7 @@ def _team_buttons(db, page: int) -> tuple[list[dict], int]:
 async def cb_team_list(cb: CallbackQuery) -> None:
     page = int(cb.data.split(":")[2] or 0)
     with session() as db:
+        user = get_user(db, cb.from_user.id, cb.from_user.username or "", cb.from_user.first_name or "")
         items, pages = _team_buttons(db, page)
     lines = ["🏎️ <b>CONSTRUCTORS' MARKET</b>\n<i>Prices are fixed by the sporting regulations.</i>\n\n"]
     if not items:
@@ -127,7 +134,7 @@ async def cb_team_list(cb: CallbackQuery) -> None:
     await show(
         cb,
         "".join(lines),
-        market_list(items, page, pages, "mk:teams:{page}", "nav:market"),
+        market_list(items, page, pages, "mk:teams:{page}", "nav:market", _lang(user)),
     )
 
 
@@ -176,11 +183,12 @@ def _driver_buttons(db, page: int) -> tuple[list[dict], int]:
 async def cb_driver_list(cb: CallbackQuery) -> None:
     page = int(cb.data.split(":")[2] or 0)
     with session() as db:
+        user = get_user(db, cb.from_user.id, cb.from_user.username or "", cb.from_user.first_name or "")
         items, pages = _driver_buttons(db, page)
     lines = ["👨‍✈️ <b>DRIVERS' MARKET</b>\n\n"]
     if not items:
         lines.append("<i>All drivers are signed. Check back next season.</i>")
-    await show(cb, "".join(lines), market_list(items, page, pages, "mk:drivers:{page}", "nav:market"))
+    await show(cb, "".join(lines), market_list(items, page, pages, "mk:drivers:{page}", "nav:market", _lang(user)))
 
 
 @router.callback_query(F.data.startswith("mk:driver:"))
@@ -235,7 +243,7 @@ async def cb_buy_first_step(cb: CallbackQuery) -> None:
         await show(
             cb,
             f"👨‍✈️ <b>{esc(driver.name) if driver else ''}</b>\n\nPick the race seat for this driver.",
-            driver_slot_picker(item_id, slots, "nav:market"),
+            driver_slot_picker(item_id, slots, "nav:market", _lang(user)),
         )
         return
 
@@ -245,13 +253,18 @@ async def cb_buy_first_step(cb: CallbackQuery) -> None:
             await show(cb, "Constructor not found.", kb(back_home("nav:market")))
             return
         price = team.price
-        name, balance = team.name, _balance(db, cb)
+        name, balance, lang = team.name, _balance(db, cb), _user_lang(db, cb)
     await show(
         cb,
         f"🏎️ <b>Confirm purchase</b>\n\n{esc(name)}\nPrice: <b>{money(price)}</b>\n"
         f"Your balance: <b>{money(balance)}</b>\nAfter purchase: <b>{money(balance - price)}</b>",
-        buy_confirm(f"team:{item_id}", f"mk:team:{item_id}:0"),
+        buy_confirm(f"team:{item_id}", f"mk:team:{item_id}:0", lang),
     )
+
+
+def _user_lang(db, cb) -> str:
+    user = get_user(db, cb.from_user.id, cb.from_user.username or "", cb.from_user.first_name or "")
+    return _lang(user)
 
 
 @router.callback_query(F.data.startswith("mk:buys:"))
@@ -263,13 +276,13 @@ async def cb_buy_seat_step(cb: CallbackQuery) -> None:
         if driver is None:
             await show(cb, "Driver not found.", kb(back_home("nav:market")))
             return
-        price, balance = driver.price, _balance(db, cb)
+        price, balance, lang = driver.price, _balance(db, cb), _user_lang(db, cb)
     await show(
         cb,
         f"👨‍✈️ <b>Confirm purchase</b>\n\n{esc(driver.name)} → seat {slot}\n"
         f"Price: <b>{money(price)}</b>\nYour balance: <b>{money(balance)}</b>\n"
         f"After purchase: <b>{money(balance - price)}</b>",
-        buy_confirm(f"driver:{driver_id}:{slot}", f"mk:driver:{driver_id}:0"),
+        buy_confirm(f"driver:{driver_id}:{slot}", f"mk:driver:{driver_id}:0", lang),
     )
 
 

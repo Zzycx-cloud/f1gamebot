@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .db import session
 from .format import esc, money
+from .i18n import t
 from .keyboards import kb, nav_row
 from .models import Driver, Race, RaceEntry, Team, User
 from .services import achievements, economy, notify, vip
@@ -99,7 +100,7 @@ def _build_sim_entries(db: Session, race: Race, grid: list[RaceEntry]) -> tuple[
     return sim_entries, names
 
 
-async def start_race(race_id: int, force: bool = False) -> str:
+async def start_race(race_id: int, force: bool = False, notify_chat_id: int | None = None) -> str:
     """Freeze the grid, simulate the distance, broadcast it and pay the prizes."""
     if race_already_handled(race_id):
         return "already handled"
@@ -128,6 +129,8 @@ async def start_race(race_id: int, force: bool = False) -> str:
         chat_ids = notify.participant_chat_ids(db, race.id) or [
             notify.owner_chat_id(db, settings.super_admin_id)
         ]
+        if notify_chat_id:
+            chat_ids = [notify_chat_id] + [c for c in chat_ids if c != notify_chat_id]
 
     if not sim_entries:
         return "no entrants"
@@ -157,6 +160,9 @@ async def start_race(race_id: int, force: bool = False) -> str:
             (e.user_id, e.finish_pos, e.points, e.money_won, e.gold_won, e.dnf, e.gap, e.pit_stops)
             for e in classification
         ]
+        user_ids = [e.user_id for e in classification] or [0]
+        users_map = {u.id: u for u in db.scalars(select(User).where(User.id.in_(user_ids)))}
+        final_text = race_standings_text(race, classification, users_map)
         next_race = None
         try:
             next_race = open_weekend(db)
@@ -166,6 +172,8 @@ async def start_race(race_id: int, force: bool = False) -> str:
 
     if bot is not None:
         for user_id, pos, points, prize, gold, dnf, gap, stops in results:
+            if user_id <= 0:  # AI drivers have no private chat
+                continue
             marker = "💥 Retired" if dnf else f"P{pos}"
             gap_txt = "" if dnf or pos == 1 else f"\nGap: <i>+{gap:.3f}s</i>"
             text = (
@@ -204,9 +212,34 @@ async def start_race(race_id: int, force: bool = False) -> str:
                     except Exception:
                         pass
 
+        # the shared "race finished" standings go to the group / origin chat
+        if notify_chat_id and bot is not None:
+            try:
+                await bot.send_message(notify_chat_id, final_text, parse_mode="HTML", disable_web_page_preview=True)
+            except Exception:
+                pass
+
         if next_race is not None:
             await announce_weekend(next_race)
     return "finished"
+
+
+def race_standings_text(race: Race, classification, users: dict) -> str:
+    """The shared 'Poyga tugadi' board: who finished where and what they won."""
+    lines = ["🏁 <b>POYGA TUGADI · ГОНКА ЗАВЕРШЕНА · RACE FINISHED</b>\n"]
+    lines.append(f"{race.flag} <b>{esc(race.gp_name)}</b> — {race.total_laps} {t('en', 'r_laps')}\n\n")
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for e in classification:
+        user = users.get(e.user_id)
+        name = (user.first_name or user.username or str(e.user_id)) if user else str(e.user_id)
+        who = svc.mention(e.user_id, name)
+        if e.dnf:
+            lines.append(f"💥 {who} — <i>DNF</i>\n")
+        else:
+            medal = medals.get(e.finish_pos, f"{e.finish_pos}.")
+            gold = f" · 🪙{e.gold_won}" if e.gold_won else ""
+            lines.append(f"{medal} {who} — <b>+{money(e.money_won)}</b> · {e.points} {t('en', 'r_pts')}{gold}\n")
+    return "".join(lines)
 
 
 async def extend_weekend(race_id: int, minutes: int, admin_id: int = 0) -> str:

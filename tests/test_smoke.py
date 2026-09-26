@@ -359,6 +359,58 @@ def test_extend_registration():
     clear_weekends()
 
 
+def test_random_track_card_on_create():
+    """Opening a weekend without a round draws a random track card."""
+    clear_weekends()
+    with session() as db:
+        race = open_weekend(db)  # no round_no -> random draw
+        assert 1 <= race.round_no <= 24
+        assert race.gp_name
+    clear_weekends()
+
+
+def test_fill_with_bots_and_autorace():
+    """/arace core: AI drivers fill the grid and the race runs to the flag."""
+    clear_weekends()
+    with session() as db:
+        race = open_weekend(db, round_no=5)
+        bots = svc.fill_with_bots(db, race, target=6)
+        assert len(bots) == 6
+        assert race.participants == 6
+        # bot accounts are negative so they can never collide with real users
+        assert all(b.id < 0 for b in bots)
+        assert all(b.team_id and b.driver1_id for b in bots)
+        race_id = race.id
+
+    outcome = asyncio.run(start_race(race_id, force=True))
+    assert outcome == "finished"
+
+    with session() as db:
+        fresh = db.get(Race, race_id)
+        assert fresh.status == "finished"
+        entries = svc.race_classification(db, race_id)
+        assert len(entries) == 6
+        assert entries[0].points == 25  # full points paid
+        assert db.query(Result).filter(Result.race_id == race_id).count() == 6
+    clear_weekends()
+
+
+def test_real_players_plus_bots_mix():
+    """A weekend with real entrants can be topped up with AI drivers."""
+    clear_weekends()
+    with session() as db:
+        race = open_weekend(db, round_no=6)
+        human = _make_team(db, 2201, "MER", ("RUS", "ANT"))
+        svc.join_race(db, race, human, economy.get_drivers(db, human))
+        bots = svc.fill_with_bots(db, race, target=5)
+        assert race.participants == 5
+        assert len(bots) == 4  # 1 human + 4 AI
+        race_id = race.id
+    outcome = asyncio.run(start_race(race_id, force=True))
+    assert outcome == "finished"
+    clear_weekends()
+
+
 def test_cannot_open_two_weekends():
     clear_weekends()
     with session() as db:

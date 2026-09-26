@@ -6,7 +6,7 @@ so each purchase leaves a transaction and a purchase record behind.
 
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -168,7 +168,8 @@ def sell_driver(db: Session, user: User, driver_id: int) -> int:
         raise ValueError("You do not own this driver.")
     payout = int(row.price_paid * store.sell_ratio(db))
     driver = db.get(Driver, driver_id)
-    wallet.add_cash(db, user, payout, "SELL_DRIVER", driver.name if driver else "")
+    if payout > 0:  # gifted/AI contracts cost nothing and pay nothing back
+        wallet.add_cash(db, user, payout, "SELL_DRIVER", driver.name if driver else "")
     if user.driver1_id == driver_id:
         user.driver1_id = None
     if user.driver2_id == driver_id:
@@ -184,13 +185,71 @@ def sell_team(db: Session, user: User, team_id: int) -> int:
         raise ValueError("You do not own this constructor.")
     payout = int(row.price_paid * store.sell_ratio(db))
     team = db.get(Team, team_id)
-    wallet.add_cash(db, user, payout, "SELL_TEAM", team.name if team else "")
+    if payout > 0:  # gifted/AI contracts cost nothing and pay nothing back
+        wallet.add_cash(db, user, payout, "SELL_TEAM", team.name if team else "")
     db.delete(row)
     if user.team_id == team_id:
         user.team_id = None
     db.flush()
     refresh_car(db, user)
     return payout
+
+
+def grant_team(db: Session, user: User, team_id: int) -> Team:
+    """Give a constructor for free (admin gift / AI driver), keeping the
+    ownership history consistent so the market never sees a ghost owner."""
+    team = db.get(Team, team_id)
+    if team is None:
+        raise ValueError("Constructor not found.")
+    for holder in db.scalars(select(User).where(User.team_id == team_id)):
+        if holder.id == user.id:
+            continue
+        row = db.scalar(select(UserTeam).where(UserTeam.user_id == holder.id, UserTeam.team_id == team_id))
+        if row is not None and row.price_paid > 0:
+            sell_team(db, holder, team_id)
+        else:
+            if row is not None:
+                db.delete(row)
+            holder.team_id = None
+    row = db.scalar(select(UserTeam).where(UserTeam.user_id == user.id, UserTeam.team_id == team_id))
+    if row is None:
+        db.add(UserTeam(user_id=user.id, team_id=team_id, price_paid=0))
+    user.team_id = team_id
+    db.flush()
+    return team
+
+
+def grant_driver(db: Session, user: User, driver_id: int, seat: int = 1) -> Driver:
+    """Sign a driver for free into ``seat`` (admin gift / AI driver)."""
+    driver = db.get(Driver, driver_id)
+    if driver is None:
+        raise ValueError("Driver not found.")
+    for holder in db.scalars(select(User).where(or_(User.driver1_id == driver_id, User.driver2_id == driver_id))):
+        if holder.id == user.id:
+            continue
+        row = db.scalar(
+            select(UserDriver).where(UserDriver.user_id == holder.id, UserDriver.driver_id == driver_id)
+        )
+        if row is not None and row.price_paid > 0:
+            sell_driver(db, holder, driver_id)
+        else:
+            if row is not None:
+                db.delete(row)
+            if holder.driver1_id == driver_id:
+                holder.driver1_id = None
+            if holder.driver2_id == driver_id:
+                holder.driver2_id = None
+    row = db.scalar(
+        select(UserDriver).where(UserDriver.user_id == user.id, UserDriver.driver_id == driver_id)
+    )
+    if row is None:
+        db.add(UserDriver(user_id=user.id, driver_id=driver_id, price_paid=0))
+    if seat == 1:
+        user.driver1_id = driver_id
+    else:
+        user.driver2_id = driver_id
+    db.flush()
+    return driver
 
 
 # --------------------------------------------------------------------------- #

@@ -55,7 +55,11 @@ async def cb_garage(event: CallbackQuery | Message) -> None:
             ("pit_crew", "🛠️ Pit crew"), ("strategy", "🧠 Strategy"),
         ):
             lines.append(f"  {label:<16} {pkg[key]:>5.1f}\n")
-    await show(event, "".join(lines), garage_menu(team is not None))
+    await show(event, "".join(lines), garage_menu(team is not None, _lang(user)))
+
+
+def _lang(user) -> str:
+    return user.language if user.language in ("ru", "uz", "en") else "en"
 
 
 # --------------------------------------------------------------------------- #
@@ -75,7 +79,7 @@ async def cb_upgrades(cb: CallbackQuery) -> None:
             cost = economy.upgrade_cost(level)
             lines.append(f"🔧 {label} — Lv <b>{level}</b> · next level {money(cost)}\n<i>{effect}</i>\n")
             items.append(btn(f"{label} Lv{level}", f"gub:{key}"))
-    await show(cb, "".join(lines), upgrade_list(items, "nav:garage"))
+    await show(cb, "".join(lines), upgrade_list(items, "nav:garage", _lang(user)))
 
 
 @router.callback_query(F.data.startswith("gub:"))
@@ -138,7 +142,7 @@ async def cb_driver_training(cb: CallbackQuery) -> None:
                 f"🎓 {label} — base {base_value}, Lv {level} · next {money(cost)}\n<i>{effect}</i>\n"
             )
             items.append(btn(f"{label} Lv{level}", f"dub:{driver.id}:{key}"))
-    await show(cb, "".join(lines), driver_training_list(items, "nav:garage"))
+    await show(cb, "".join(lines), driver_training_list(items, "nav:garage", _lang(user)))
 
 
 @router.callback_query(F.data.startswith("dub:"))

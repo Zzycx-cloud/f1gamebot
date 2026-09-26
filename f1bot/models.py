@@ -230,6 +230,9 @@ class User(Base):
     tire_kits: Mapped[int] = mapped_column(Integer, default=0)
     badge: Mapped[str] = mapped_column(String(32), default="")
 
+    # Interface language: "ru" / "uz" / "en" ("" = not picked yet)
+    language: Mapped[str] = mapped_column(String(8), default="")
+
     # Moderation / anti-flood
     last_reset_key: Mapped[str] = mapped_column(String(10), default="")
     last_action_ts: Mapped[float] = mapped_column(Float, default=0.0)

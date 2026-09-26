@@ -15,7 +15,20 @@ async def show(
     alert: str | None = None,
     show_alert: bool = False,
 ) -> None:
-    """Edit the current message (callback) or send a new one (command)."""
+    """Edit the current message (callback) or send a new one (command).
+
+    Every screen rendered from a callback press is recorded in the per-user
+    navigation history so the ⬅️ Back button can return to the previous screen.
+    """
+    if isinstance(event, CallbackQuery):
+        data = getattr(event, "data", None)
+        if data and data != "nav:back":
+            from .services.runtime import push_screen
+
+            try:
+                push_screen(event.from_user.id, data)
+            except Exception:
+                pass
     if not isinstance(event, Message):
         message = getattr(event, "message", None)
         if message is not None:

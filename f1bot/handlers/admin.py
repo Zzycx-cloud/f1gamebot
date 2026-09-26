@@ -18,6 +18,7 @@ from ..config import settings
 from ..db import get_user, session
 from ..flow import announce_weekend, open_weekend, start_race, weekend_summary
 from ..format import esc, money, pager
+from ..i18n import t
 from ..keyboards import (
     admin_ban_menu,
     admin_broadcast_confirm,
@@ -63,7 +64,15 @@ class Admin(StatesGroup):
 
 def guard(event) -> bool:
     user = getattr(event, "from_user", None)
-    return bool(user and settings.is_admin(user.id))
+    if not (user and settings.is_admin(user.id)):
+        return False
+    # The admin panel lives in the bot's private chat only — never in groups.
+    chat = getattr(
+        getattr(event, "message", None) if isinstance(event, CallbackQuery) else event, "chat", None
+    )
+    if getattr(chat, "type", "private") in ("group", "supergroup"):
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -1514,3 +1523,171 @@ async def cb_admin_guard(cb: CallbackQuery) -> None:
         await cb.answer("Unknown admin action", show_alert=True)
     else:
         await cb.answer("Admins only", show_alert=True)
+
+
+# --------------------------------------------------------------------------- #
+# Quick commands: give money / gold / VIP / upgrades / drivers by id or @username
+# Everything is admin-only, validated server-side and written to the admin log.
+# --------------------------------------------------------------------------- #
+#: car part name -> User column
+PART_COLUMNS = {
+    "engine": "up_engine", "aero": "up_aero", "tires": "up_tires",
+    "reliability": "up_reliability", "fuel": "up_fuel", "ers": "up_ers",
+    "pitcrew": "up_pitcrew", "race_pace": "up_race_pace", "quali_pace": "up_quali_pace",
+    "chassis": "up_chassis", "strategy": "up_strategy",
+}
+
+
+def _resolve_target(db, ref: str) -> User | None:
+    """Find a player by numeric id or @username (case-insensitive)."""
+    ref = (ref or "").strip().lstrip("@")
+    if not ref:
+        return None
+    if ref.lstrip("-").isdigit():
+        return db.get(User, int(ref))
+    return db.scalar(select(User).where(func.lower(User.username) == ref.lower()))
+
+
+async def _command_guard(message: Message) -> bool:
+    if not settings.is_admin(message.from_user.id):
+        await message.answer("⛔ Admins only.")
+        return False
+    return True
+
+
+@router.message(Command("give", "givecash", "pul"))
+async def cmd_give_cash(message: Message, command: CommandObject) -> None:
+    """/give <id|@user> <amount> — hand out cash."""
+    if not await _command_guard(message):
+        return
+    parts = (command.args or "").split()
+    if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
+        await message.answer("Usage: <code>/give 123456 10000000</code> (id or @username)", parse_mode="HTML")
+        return
+    with session() as db:
+        target = _resolve_target(db, parts[0])
+        if target is None:
+            await message.answer(f"🚫 Player not found: <code>{esc(parts[0])}</code>", parse_mode="HTML")
+            return
+        amount = int(parts[1])
+        wallet.add_cash(db, target, amount, "ADMIN_GIFT", f"admin {message.from_user.id}")
+        adminlog.log(db, message.from_user.id, "GIVE_CASH", target.id, amount, "command")
+        name, balance = target.display_name, target.balance
+    await message.answer(f"✅ <b>{esc(name)}</b>: +{money(amount)}\n💰 {t('en', 'p_cash')}: {money(balance)}", parse_mode="HTML")
+
+
+@router.message(Command("givegold", "givecoin", "coin"))
+async def cmd_give_gold(message: Message, command: CommandObject) -> None:
+    """/givegold <id|@user> <amount> — hand out gold."""
+    if not await _command_guard(message):
+        return
+    parts = (command.args or "").split()
+    if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
+        await message.answer("Usage: <code>/givegold 123456 50</code>", parse_mode="HTML")
+        return
+    with session() as db:
+        target = _resolve_target(db, parts[0])
+        if target is None:
+            await message.answer(f"🚫 Player not found: <code>{esc(parts[0])}</code>", parse_mode="HTML")
+            return
+        amount = int(parts[1])
+        wallet.add_gold(db, target, amount, "ADMIN_GIFT", f"admin {message.from_user.id}")
+        adminlog.log(db, message.from_user.id, "GIVE_GOLD", target.id, amount, "command")
+        name, gold = target.display_name, target.gold
+    await message.answer(f"✅ <b>{esc(name)}</b>: +{amount} 🪙\n🪙 {t('en', 'p_gold')}: {gold}", parse_mode="HTML")
+
+
+@router.message(Command("givevip", "vip"))
+async def cmd_give_vip(message: Message, command: CommandObject) -> None:
+    """/givevip <id|@user> <level> [days] — days 0 means permanent."""
+    if not await _command_guard(message):
+        return
+    parts = (command.args or "").split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("Usage: <code>/givevip 123456 3 30</code> (days 0 = permanent)", parse_mode="HTML")
+        return
+    days = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 30
+    with session() as db:
+        target = _resolve_target(db, parts[0])
+        if target is None:
+            await message.answer(f"🚫 Player not found: <code>{esc(parts[0])}</code>", parse_mode="HTML")
+            return
+        vip.grant(db, target, int(parts[1]), days, admin_id=message.from_user.id)
+        adminlog.log(db, message.from_user.id, "GIVE_VIP", target.id, int(parts[1]), f"{days}d")
+        name = target.display_name
+        level = target.vip_level
+    span = t("en", "adm_days_perm") if days <= 0 else f"{days}d"
+    await message.answer(f"✅ <b>{esc(name)}</b>: VIP {level} ({span})", parse_mode="HTML")
+
+
+@router.message(Command("givecar", "upgrade", "kuchaytir"))
+async def cmd_give_car(message: Message, command: CommandObject) -> None:
+    """/givecar <id|@user> <part> [levels] — boost a car part."""
+    if not await _command_guard(message):
+        return
+    parts = (command.args or "").split()
+    if len(parts) < 2 or parts[1].lower() not in PART_COLUMNS:
+        await message.answer(
+            "Usage: <code>/givecar 123456 engine 3</code>\nParts: " + ", ".join(sorted(PART_COLUMNS)),
+            parse_mode="HTML",
+        )
+        return
+    levels = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+    column = PART_COLUMNS[parts[1].lower()]
+    with session() as db:
+        target = _resolve_target(db, parts[0])
+        if target is None:
+            await message.answer(f"🚫 Player not found: <code>{esc(parts[0])}</code>", parse_mode="HTML")
+            return
+        new_level = min(settings.upgrade_max_level, int(getattr(target, column) or 0) + levels)
+        setattr(target, column, new_level)
+        adminlog.log(db, message.from_user.id, "GIVE_UPGRADE", target.id, new_level, column)
+        name = target.display_name
+    await message.answer(f"✅ <b>{esc(name)}</b>: {column} → <b>{new_level}</b>", parse_mode="HTML")
+
+
+@router.message(Command("givedriver", "driver"))
+async def cmd_give_driver(message: Message, command: CommandObject) -> None:
+    """/givedriver <id|@user> <CODE> [seat 1|2] — sign a driver for free."""
+    if not await _command_guard(message):
+        return
+    parts = (command.args or "").split()
+    if len(parts) < 2:
+        await message.answer("Usage: <code>/givedriver 123456 VER 1</code>", parse_mode="HTML")
+        return
+    seat = int(parts[2]) if len(parts) > 2 and parts[2] in ("1", "2") else 1
+    with session() as db:
+        target = _resolve_target(db, parts[0])
+        driver = db.scalar(select(Driver).where(Driver.code == parts[1].upper()))
+        if target is None or driver is None:
+            missing = "driver" if driver is None else "player"
+            await message.answer(f"🚫 {missing.capitalize()} not found: <code>{esc(parts[1] if driver is None else parts[0])}</code>", parse_mode="HTML")
+            return
+        economy.grant_driver(db, target, driver.id, seat)
+        adminlog.log(db, message.from_user.id, "GIVE_DRIVER", target.id, driver.id, f"seat {seat}")
+        name = target.display_name
+        dname = driver.name
+    await message.answer(f"✅ <b>{esc(name)}</b>: {t('en', 'p_driver')} {seat} → <b>{esc(dname)}</b>", parse_mode="HTML")
+
+
+@router.message(Command("giveteam", "team"))
+async def cmd_give_team(message: Message, command: CommandObject) -> None:
+    """/giveteam <id|@user> <CODE> — give a constructor for free."""
+    if not await _command_guard(message):
+        return
+    parts = (command.args or "").split()
+    if len(parts) != 2:
+        await message.answer("Usage: <code>/giveteam 123456 FER</code>", parse_mode="HTML")
+        return
+    with session() as db:
+        target = _resolve_target(db, parts[0])
+        team = db.scalar(select(Team).where(Team.code == parts[1].upper()))
+        if target is None or team is None:
+            missing = "team" if team is None else "player"
+            await message.answer(f"🚫 {missing.capitalize()} not found: <code>{esc(parts[1] if team is None else parts[0])}</code>", parse_mode="HTML")
+            return
+        economy.grant_team(db, target, team.id)
+        adminlog.log(db, message.from_user.id, "GIVE_TEAM", target.id, team.id, team.code)
+        name = target.display_name
+        tname = team.name
+    await message.answer(f"✅ <b>{esc(name)}</b>: {t('en', 'p_team')} → <b>{esc(tname)}</b>", parse_mode="HTML")

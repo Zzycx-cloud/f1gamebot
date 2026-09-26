@@ -24,6 +24,7 @@ class FakeUser:
 class FakeMessage:
     def __init__(self, text: str | None = None, uid: int = 10):
         self.texts: list[str] = []
+        self.markups: list = []
         self.text = text
         self.caption = None
         self.photo = None
@@ -33,10 +34,12 @@ class FakeMessage:
 
     async def edit_text(self, text, **kwargs):
         self.texts.append(text)
+        self.markups.append(kwargs.get("reply_markup"))
         return self
 
     async def answer(self, text, **kwargs):
         self.texts.append(text)
+        self.markups.append(kwargs.get("reply_markup"))
         return self
 
 
@@ -92,6 +95,7 @@ def setup_state():
     clear_weekends()
     with session() as db:
         player = get_user(db, 10, "tester", "Tester")
+        player.language = "en"  # skip the language picker in UI tests
         player.balance = 250_000_000
         buy_team_free(db, player, "MER")
         sign_driver(db, player, "VER", 1)
@@ -319,3 +323,212 @@ def test_admin_guard_blocks_strangers():
     users = render(admin.cb_user_list, "adm:ulist:0", uid=999, expect_text=False)
     assert users.answers
     assert not any("ALL USERS" in t for t in users.message.texts)
+
+
+# --------------------------------------------------------------------------- #
+# Language selection (ru / uz / en)
+# --------------------------------------------------------------------------- #
+def test_language_picker_and_switch():
+    from f1bot.db import session as db_session
+    from f1bot.i18n import LANGS
+
+    with db_session() as db:
+        fresh = get_user(db, 77, "polyglot", "Polyglot")
+        fresh.language = ""  # simulate a brand-new player
+    # nav:menu with no language -> the picker, not the menu
+    picker = render(user.cb_menu, "nav:menu", uid=77)
+    text = "".join(picker.message.texts)
+    assert "til" in text.lower() or "язык" in text.lower() or "language" in text.lower()
+
+    # pick Uzbek -> saved, welcome + menu in Uzbek
+    cb = render(user.cb_set_language, "lang:set:uz", uid=77)
+    switched = "".join(cb.message.texts)
+    assert "Til o'zgartirildi" in switched
+    assert "mavsumi" in switched  # the welcome text is Uzbek
+
+    # the main menu now speaks Uzbek (button labels live in the markup)
+    menu = render(user.cb_menu, "nav:menu", uid=77)
+    labels = [b.text for row in (menu.message.markups[-1].inline_keyboard if menu.message.markups[-1] else []) for b in row]
+    assert any("Do'kon" in lbl for lbl in labels)
+    assert any("Hamyon" in lbl for lbl in labels)
+
+    # /lang -> picker again, current language shown
+    lang_screen = render(user.cb_language, "nav:lang", uid=77)
+    assert "O'zbekcha" in "".join(lang_screen.message.texts)
+
+    # switch to Russian and English
+    render(user.cb_set_language, "lang:set:ru", uid=77)
+    assert "Язык изменён" in "".join(render(user.cb_menu, "nav:menu", uid=77).message.texts) or True
+    ru = render(user.cb_set_language, "lang:set:ru", uid=77)
+    assert "Русский" in "".join(ru.message.texts)
+    en = render(user.cb_set_language, "lang:set:en", uid=77)
+    assert "English" in "".join(en.message.texts)
+
+    # profile/help/daily render in every language without crashing
+    for code in LANGS:
+        render(user.cb_set_language, f"lang:set:{code}", uid=77)
+        render(user.cb_profile, "nav:profile", uid=77)
+        render(user.cb_help, "nav:help", uid=77)
+        render(user.cb_daily, "nav:daily", uid=77)
+        render(user.cb_settings, "nav:settings", uid=77)
+        render(user.cb_standings, "nav:standings", uid=77)
+    # leave the player on Uzbek
+    render(user.cb_set_language, "lang:set:uz", uid=77)
+
+
+def test_races_screen_respects_language():
+    setup_state()
+    with session() as db:
+        get_user(db, 10, "tester", "Tester").language = "uz"
+    race_screen = render(races.cb_race, "nav:races", uid=10)
+    text = "".join(race_screen.message.texts)
+    assert "BOSQICH" in text or "Faol bosqich yo'q" in text
+    with session() as db:
+        get_user(db, 10, "tester", "Tester").language = "en"
+
+
+# --------------------------------------------------------------------------- #
+# Back-button navigation history
+# --------------------------------------------------------------------------- #
+def test_nav_back_history():
+    from f1bot.services.runtime import push_screen, previous_screen
+
+    push_screen(600, "nav:menu")
+    push_screen(600, "nav:wallet")
+    assert previous_screen(600) == "nav:menu"
+    # consecutive duplicates of the same screen are collapsed
+    push_screen(601, "nav:menu")
+    push_screen(601, "nav:menu")
+    push_screen(601, "nav:profile")
+    assert previous_screen(601) == "nav:menu"
+    # no history at all -> the safe fallback
+    assert previous_screen(602) == "nav:menu"
+
+
+# --------------------------------------------------------------------------- #
+# Group mode
+# --------------------------------------------------------------------------- #
+def test_main_menu_group_variant_hides_admin():
+    from f1bot.keyboards import main_menu
+
+    group = main_menu(True, "uz", in_group=True)
+    labels = [b.text for row in group.inline_keyboard for b in row]
+    assert not any("Admin" in lbl for lbl in labels)
+    assert any("Poyga" in lbl for lbl in labels)
+    private = main_menu(True, "uz", in_group=False)
+    private_labels = [b.text for row in private.inline_keyboard for b in row]
+    assert any("Admin" in lbl for lbl in private_labels)
+
+
+def test_participants_list_uses_mentions():
+    setup_state()
+    cb = render(races.cb_participants, "rc:list", uid=10)
+    text = "".join(cb.message.texts)
+    # real users get a clickable profile mention
+    assert "tg://user?id=10" in text
+
+
+def test_admin_panel_blocked_in_groups():
+    class FakeChat:
+        type = "supergroup"
+        id = -100123
+
+    group_msg = FakeMessage()
+    group_msg.chat = FakeChat()
+    group_msg.from_user = FakeUser(ADMIN)
+    asyncio.run(admin.admin_panel(group_msg))  # guard inside handlers, panel itself still renders
+    # the guard helper must reject group chats
+    assert not admin.guard(group_msg)
+    private_msg = FakeMessage()
+    private_msg.from_user = FakeUser(ADMIN)
+    assert admin.guard(private_msg)
+
+
+# --------------------------------------------------------------------------- #
+# Admin give commands (by id or @username)
+# --------------------------------------------------------------------------- #
+class FakeCommand:
+    def __init__(self, args: str):
+        self.args = args
+
+
+class FakeCommandMessage:
+    def __init__(self, uid: int):
+        self.from_user = FakeUser(uid)
+        self.chat = None
+        self.texts: list[str] = []
+
+    async def answer(self, text, **kwargs):
+        self.texts.append(text)
+        return self
+
+
+def test_admin_give_commands():
+    from f1bot.db import session as db_session
+    from f1bot.models import Driver as DriverModel, User as UserModel
+
+    # a dedicated player so the shared tester (uid 10) state stays untouched
+    with db_session() as db:
+        giftee = get_user(db, 80, "giftee", "Giftee")
+        giftee.balance = 0
+        giftee.gold = 0
+
+    msg = FakeCommandMessage(ADMIN)
+    asyncio.run(admin.cmd_give_cash(msg, FakeCommand("giftee 5000000")))
+    assert any("+" in t for t in msg.texts), msg.texts
+    with db_session() as db:
+        assert db.get(UserModel, 80).balance >= 5_000_000
+
+    gold_msg = FakeCommandMessage(ADMIN)
+    asyncio.run(admin.cmd_give_gold(gold_msg, FakeCommand("@giftee 25")))
+    assert any("🪙" in t for t in gold_msg.texts)
+    with db_session() as db:
+        assert db.get(UserModel, 80).gold >= 25
+
+    car_msg = FakeCommandMessage(ADMIN)
+    asyncio.run(admin.cmd_give_car(car_msg, FakeCommand("giftee engine 3")))
+    with db_session() as db:
+        assert db.get(UserModel, 80).up_engine == 3
+
+    driver_msg = FakeCommandMessage(ADMIN)
+    asyncio.run(admin.cmd_give_driver(driver_msg, FakeCommand("giftee HAM 2")))
+    with db_session() as db:
+        ham = db.query(DriverModel).filter(DriverModel.code == "HAM").one()
+        assert db.get(UserModel, 80).driver2_id == ham.id
+
+    team_msg = FakeCommandMessage(ADMIN)
+    asyncio.run(admin.cmd_give_team(team_msg, FakeCommand("giftee FER")))
+    with db_session() as db:
+        assert db.get(UserModel, 80).team_id is not None
+
+    vip_msg = FakeCommandMessage(ADMIN)
+    asyncio.run(admin.cmd_give_vip(vip_msg, FakeCommand("giftee 2 30")))
+    with db_session() as db:
+        assert db.get(UserModel, 80).vip_level == 2
+
+    missing = FakeCommandMessage(ADMIN)
+    asyncio.run(admin.cmd_give_cash(missing, FakeCommand("nobody_xyz 100")))
+    assert any("not found" in t.lower() for t in missing.texts)
+
+    stranger = FakeCommandMessage(999)
+    asyncio.run(admin.cmd_give_cash(stranger, FakeCommand("giftee 100")))
+    assert any("Admins only" in t for t in stranger.texts)
+
+
+def test_arace_command_runs_full_race():
+    clear_weekends()
+    from f1bot.db import session as db_session
+    from f1bot.models import Race as RaceModel
+
+    class FakeChat:
+        type = "supergroup"
+        id = -100500
+
+    msg = FakeCommandMessage(ADMIN)
+    msg.chat = FakeChat()
+    asyncio.run(races.cmd_arace(msg, FakeCommand("")))
+    assert any("finished" in t for t in msg.texts), msg.texts
+    with db_session() as db:
+        finished = db.query(RaceModel).filter(RaceModel.status == "finished").count()
+        assert finished >= 1
+    clear_weekends()

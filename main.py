@@ -18,7 +18,7 @@ from f1bot.flow import start_race
 from f1bot.handlers import admin, garage, market, races, user
 from f1bot.seed import seed_all
 from f1bot.services import races as svc
-from f1bot.services.runtime import ThrottleMiddleware, set_bot, spawn_auto_start
+from f1bot.services.runtime import ThrottleMiddleware, set_bot, set_bot_username, set_dispatcher, spawn_auto_start
 from f1bot.web import start_health_server
 
 log = logging.getLogger("f1bot")
@@ -61,9 +61,11 @@ async def main() -> None:
     dp.errors.register(on_error)
     for router in (user.router, market.router, garage.router, races.router, admin.router):
         dp.include_router(router)
+    set_dispatcher(dp)  # enables the history-based ⬅️ Back button
 
     await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
+    set_bot_username(me.username)
     log.info("Logged in as @%s (id %s)", me.username, me.id)
 
     if open_race is not None and open_race.status == "open":
